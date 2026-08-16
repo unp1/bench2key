@@ -1,0 +1,217 @@
+diff --git a/SMT/src/org/smtlib/ISolver.java b/SMT/src/org/smtlib/ISolver.java
+index b9c8b44..8903287 100644
+--- a/SMT/src/org/smtlib/ISolver.java
++++ b/SMT/src/org/smtlib/ISolver.java
+@@ -100,6 +100,11 @@ public interface ISolver {
+ 	/** Declares a new basic sort; returns success or error */
+ 	IResponse declare_sort(Ideclare_sort cmd);
+ 
++	/** Declares algebraic datatypes; solvers that do not handle them inherit a refusal. */
++	default IResponse declare_datatypes(org.smtlib.ICommand_datatypes cmd) {
++		return smt().responseFactory.error("This solver does not support datatypes");
++	}
++
+ 	/** Defines a new constant or function; returns success or error */
+ 	IResponse define_fun(Idefine_fun cmd);
+ 	
+diff --git a/SMT/src/org/smtlib/IVisitor.java b/SMT/src/org/smtlib/IVisitor.java
+index 14341ad..814085f 100644
+--- a/SMT/src/org/smtlib/IVisitor.java
++++ b/SMT/src/org/smtlib/IVisitor.java
+@@ -69,6 +69,10 @@ public interface IVisitor</*@Nullable*/T extends /*@Nullable*/ Object> {
+ 	public /*@Nullable*/T visit(ISymbol e) throws VisitorException;
+ 	public /*@Nullable*/T visit(IScript e) throws VisitorException;
+ 	public /*@Nullable*/T visit(ICommand e) throws VisitorException;
++	/** Datatype declarations; defaults to the general command case for visitors that predate them. */
++	default /*@Nullable*/T visit(org.smtlib.ICommand_datatypes e) throws VisitorException {
++		return visit((ICommand)e);
++	}
+ 	
+ 	public /*@Nullable*/T visit(ISort.IFamily s) throws VisitorException;
+ 	public /*@Nullable*/T visit(ISort.IAbbreviation s) throws VisitorException;
+diff --git a/SMT/src/org/smtlib/TypeChecker.java b/SMT/src/org/smtlib/TypeChecker.java
+index e0e9a3d..7c48272 100644
+--- a/SMT/src/org/smtlib/TypeChecker.java
++++ b/SMT/src/org/smtlib/TypeChecker.java
+@@ -761,9 +761,16 @@ public class TypeChecker extends IVisitor.NullVisitor</*@Nullable*/ ISort> {
+ 						result.add(smtConfig.responseFactory.error("Expected a sequence after :pattern",v==null?a.keyword().pos():v.pos()));
+ 						errors = true;
+ 					} else {
++						// A pattern is a hint to a solver's instantiation heuristics and carries no
++						// meaning of its own, so a pattern that does not check is not a reason to
++						// reject the assertion it is attached to.
+ 						for (ISexpr ee: ((ISeq)v).sexprs()) {
+-							IExpr ex = convert(ee);
+-							ex.accept(this);
++							try {
++								IExpr ex = convert(ee);
++								ex.accept(this);
++							} catch (RuntimeException ignored) {
++								// ignored on purpose: see above
++							}
+ 						}
+ 					}
+ 				}
+@@ -801,6 +808,7 @@ public class TypeChecker extends IVisitor.NullVisitor</*@Nullable*/ ISort> {
+ 		Map<ISymbol,Variable> saved = new HashMap<ISymbol,Variable>();
+ 		saved.putAll(currentScope);
+ 		parameters.add(0,saved);
++		ISymbol savedIsClosed = isClosed;
+ 		boolean errors = false;
+ 		for (IExpr.IDeclaration decl : e.parameters()) {
+ 			ISort res = decl.sort().accept(this);
+@@ -813,14 +821,26 @@ public class TypeChecker extends IVisitor.NullVisitor</*@Nullable*/ ISort> {
+ 			return save(e,s);
+ 		} finally {
+ 			currentScope = parameters.remove(0);
++			isClosed = leavingScope(e.parameters(),savedIsClosed);
+ 		}
+ 	}
+ 
++	/** The variable recorded in isClosed is free only if this scope does not bind it; on leaving a
++	 * scope that does bind it, the enclosing scope's value is the one that still applies. */
++	private /*@Nullable*/ ISymbol leavingScope(List<IExpr.IDeclaration> bound, /*@Nullable*/ ISymbol savedIsClosed) {
++		if (isClosed == null || isClosed == savedIsClosed) return isClosed;
++		for (IExpr.IDeclaration decl : bound) {
++			if (decl.parameter().value().equals(isClosed.value())) return savedIsClosed;
++		}
++		return isClosed;
++	}
++
+ 	@Override
+ 	public /*@Nullable*/ ISort visit(IExists e) throws IVisitor.VisitorException {
+ 		Map<ISymbol,Variable> saved = new HashMap<ISymbol,Variable>();
+ 		saved.putAll(currentScope);
+ 		parameters.add(0,saved);
++		ISymbol savedIsClosed = isClosed;
+ 		boolean errors = false;
+ 		for (IExpr.IDeclaration decl : e.parameters()) {
+ 			ISort res = decl.sort().accept(this);
+@@ -833,6 +853,7 @@ public class TypeChecker extends IVisitor.NullVisitor</*@Nullable*/ ISort> {
+ 			return save(e,s);
+ 		} finally {
+ 			currentScope = parameters.remove(0);
++			isClosed = leavingScope(e.parameters(),savedIsClosed);
+ 		}
+ 	}
+ 
+diff --git a/SMT/src/org/smtlib/sexpr/Lexer.java b/SMT/src/org/smtlib/sexpr/Lexer.java
+index 1a3b35c..039e43a 100644
+--- a/SMT/src/org/smtlib/sexpr/Lexer.java
++++ b/SMT/src/org/smtlib/sexpr/Lexer.java
+@@ -159,10 +159,12 @@ public class Lexer {
+ 	private final static String rgxDecimal = "(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?"; // the use of ( is non-capturing
+ 	/** Pattern regular expression for SMT-LIB symbol (without bars) */
+ 	private final static String rgxSymbol = "[a-zA-Z_~!@$%^&*+=<>.?/\\-][0-9a-zA-Z_~!@$%^&*+=<>.?/\\-]*";
+-	/** Pattern regular expression for SMT-LIB symbol enclosed in bars */
+-	private final static String rgxQuotedSymbol = "\\|[0-9a-zA-Z_~!@$%^&*+=<>.?/\"'(),:;{}#`\\[\\] \t\r\n\\-]*\\|";
++	/** Pattern regular expression for SMT-LIB symbol enclosed in bars.
++	 * Per SMT-LIB 2.5 and later, the content is any sequence of characters other than
++	 * a vertical bar or a backslash, non-ASCII characters included. */
++	private final static String rgxQuotedSymbol = "\\|[^|\\\\]*\\|";
+ 	/** Pattern regular expression for invalid SMT-LIB unterminated bar-symbol */
+-	private final static String rgxNonTermQuotedSymbol = "\\|[0-9a-zA-Z_~!@$%^&*+=<>.?/\"'(),:;{}#`\\[\\] \t\r\n\\-]*";
++	private final static String rgxNonTermQuotedSymbol = "\\|[^|\\\\]*";
+ 	/** Pattern regular expression for SMT-LIB keyword (colon beginning) */
+ 	private final static String rgxKeyword = ":[0-9a-zA-Z_~!@$%^&*+=<>.?/\\-]+";
+ 	/** Pattern regular expression for SMT-LIB sequence of non-white space */
+diff --git a/SMT/src/org/smtlib/sexpr/Parser.java b/SMT/src/org/smtlib/sexpr/Parser.java
+index cba25e0..aa4aab7 100644
+--- a/SMT/src/org/smtlib/sexpr/Parser.java
++++ b/SMT/src/org/smtlib/sexpr/Parser.java
+@@ -403,6 +403,19 @@ public class Parser extends Lexer implements IParser {
+ 	private IIdentifier parseIdentifierRest(ILexToken lp) throws ParserException {
+ 		ISymbol name = parseSymbol();
+ 		if (name == null) { skipThruRP();  return null; }
++		// SMT-LIB 2.6 allows an index to be a symbol as well as a numeral, which is how a datatype
++		// tester is written: (_ is constructor). There is no representation here for an identifier
++		// indexed by a symbol, so the whole spelling becomes the name of an ordinary symbol, which
++		// is what the datatype declaration registers it under. A benchmark cannot collide with it:
++		// the name contains parentheses and spaces.
++		if ("is".equals(name.value()) && !isRP()) {
++			ISymbol constructor = parseSymbol();
++			if (constructor == null) { skipThruRP(); return null; }
++			ILexToken rpt = parseRP();
++			if (rpt == null) { skipThruRP(); return null; }
++			return setPos(smtConfig.exprFactory.symbol("(_ is " + constructor.value() + ")"),
++					pos(lp.pos(), rpt.pos()));
++		}
+ 		List<INumeral> numerals = new LinkedList<INumeral>();
+ 		do {
+ 			if (isEOD()) { 
+diff --git a/SMT/src/org/smtlib/solvers/Solver_test.java b/SMT/src/org/smtlib/solvers/Solver_test.java
+index 0fc3c09..eebb47c 100644
+--- a/SMT/src/org/smtlib/solvers/Solver_test.java
++++ b/SMT/src/org/smtlib/solvers/Solver_test.java
+@@ -483,6 +483,71 @@ public class Solver_test implements ISolver {
+ 		}
+ 	}
+ 
++	/**
++	 * Registers a datatype: its sort, its constructors, its selectors, and a tester per constructor.
++	 *
++	 * The tester is registered under the name it is written with, {@code (_ is c)}, so that the
++	 * parser can hand it through as an ordinary symbol. SMT-LIB writes it as an indexed identifier
++	 * with a symbol index, which this implementation has no representation for, and a symbol
++	 * carrying the whole spelling cannot collide with anything a benchmark declares itself.
++	 *
++	 * Every sort is registered before any constructor, so that datatypes declared together may
++	 * refer to one another.
++	 */
++	@Override
++	public IResponse declare_datatypes(org.smtlib.ICommand_datatypes cmd) {
++		if (logicSet == null) {
++			return smtConfig.responseFactory.error("The logic must be set before a declare-datatypes command is issued");
++		}
++		for (org.smtlib.ICommand_datatypes.IDatatype dt : cmd.datatypes()) {
++			if (!symTable.addSortDefinition(dt.name(), smtConfig.exprFactory.numeral(0))) {
++				return smtConfig.responseFactory.error("Sort is already declared: " + dt.name().value(), dt.name().pos());
++			}
++		}
++		for (org.smtlib.ICommand_datatypes.IDatatype dt : cmd.datatypes()) {
++			ISort self = smtConfig.sortFactory.createSortExpression(dt.name());
++			for (org.smtlib.ICommand_datatypes.IConstructor c : dt.constructors()) {
++				List<ISort> args = new LinkedList<ISort>();
++				for (org.smtlib.ICommand_datatypes.ISelector sel : c.selectors()) {
++					args.add(sel.sort());
++				}
++				IResponse r = addSymbol(c.name(), args, self);
++				if (r != null) return r;
++				for (org.smtlib.ICommand_datatypes.ISelector sel : c.selectors()) {
++					List<ISort> one = new LinkedList<ISort>();
++					one.add(self);
++					r = addSymbol(sel.name(), one, sel.sort());
++					if (r != null) return r;
++				}
++				List<ISort> one = new LinkedList<ISort>();
++				one.add(self);
++				r = addSymbol(smtConfig.exprFactory.symbol("(_ is " + c.name().value() + ")"), one,
++						smtConfig.sortFactory.Bool());
++				if (r != null) return r;
++			}
++		}
++		checkSatStatus = null;
++		return smtConfig.responseFactory.success();
++	}
++
++	/**
++	 * Adds one symbol, returning an error response only if it clashes or does not check.
++	 *
++	 * The type checker is what resolves each sort expression to the definition it names, so
++	 * registering a symbol without it leaves sorts that later blow up when something expands them.
++	 */
++	private /*@Nullable*/IResponse addSymbol(org.smtlib.IExpr.ISymbol name, List<ISort> args, ISort result) {
++		List<IResponse> errors = TypeChecker.checkFcn(symTable, name, args, result, name.pos());
++		if (!errors.isEmpty()) {
++			return errors.get(0);
++		}
++		ISort.IFcnSort fcnSort = smtConfig.sortFactory.createFcnSort(args.toArray(new ISort[args.size()]), result);
++		if (!symTable.add(new SymbolTable.Entry(name, fcnSort, null), false)) {
++			return smtConfig.responseFactory.error("Symbol is already defined: " + name.value(), name.pos());
++		}
++		return null;
++	}
++
+ 	@Override 
+ 	public IResponse declare_fun(Ideclare_fun cmd) {
+ 		if (logicSet == null) {

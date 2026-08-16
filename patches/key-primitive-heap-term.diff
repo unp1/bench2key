@@ -1,0 +1,46 @@
+diff --git a/key.core/src/main/java/de/uka/ilkd/key/strategy/termfeature/PrimitiveHeapTermFeature.java b/key.core/src/main/java/de/uka/ilkd/key/strategy/termfeature/PrimitiveHeapTermFeature.java
+index fb491ef4e4..5f0fdb6908 100644
+--- a/key.core/src/main/java/de/uka/ilkd/key/strategy/termfeature/PrimitiveHeapTermFeature.java
++++ b/key.core/src/main/java/de/uka/ilkd/key/strategy/termfeature/PrimitiveHeapTermFeature.java
+@@ -26,6 +26,28 @@ public final class PrimitiveHeapTermFeature extends BinaryTermFeature {
+         return new PrimitiveHeapTermFeature(heapLDT);
+     }
+ 
++    /** Whether the term builds a heap from another one, so that something in it may collapse. */
++    /**
++     * Whether the term builds a heap out of another heap.
++     *
++     * Asked structurally rather than against a list of the operators the heap theory happens to
++     * have: what the callers want to know is whether anything inside the term can still collapse,
++     * and that is exactly the case when the term is a heap assembled from a heap. Anything else, a
++     * constant, a variable, or an application producing a heap without consuming one, is as inert
++     * as the base heap however it is written.
++     */
++    private boolean isHeapTransformer(Term t) {
++        if (t.sort() != heapLDT.targetSort()) {
++            return false;
++        }
++        for (int i = 0; i < t.arity(); i++) {
++            if (t.sub(i).sort() == heapLDT.targetSort()) {
++                return true;
++            }
++        }
++        return false;
++    }
++
+     @Override
+     protected boolean filter(Term t, MutableState mState, LogicServices services) {
+         // t.op() is the base heap or another primitive heap variable
+@@ -37,6 +59,12 @@ public final class PrimitiveHeapTermFeature extends BinaryTermFeature {
+         // the location variables which are created in the block contract rule
+         // also need to be classified primitive
+         isPrimitive = isPrimitive || (t.op() instanceof LocationVariable);
++        // A heap that is not built by one of the heap-modifying operators is primitive whatever
++        // its operator: nothing inside it can collapse, which is what the callers ask about. The
++        // list of known heap variables catches the heaps a Java proof works with, but a problem
++        // file may introduce heap-sorted constants of its own, and those are just as inert as the
++        // base heap.
++        isPrimitive = isPrimitive || !isHeapTransformer(t);
+         return isPrimitive;
+     }
+ }

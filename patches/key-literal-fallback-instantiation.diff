@@ -1,0 +1,79 @@
+--- /tmp/orig.java	2026-07-30 20:08:18
++++ /tmp/keep.java	2026-07-30 20:08:18
+@@ -5,9 +5,11 @@
+ 
+ import java.util.ArrayList;
+ import java.util.HashMap;
++import java.util.LinkedHashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ 
+ import de.uka.ilkd.key.java.Services;
+ import de.uka.ilkd.key.ldt.JavaDLTheory;
+@@ -88,10 +90,64 @@
+         // write-coordinate candidates are part of the theory-aware selection, dropped in classic
+         if (!classic) {
+             addStoreCoordinateInstances((JTerm) matrix, services);
++            // Ground candidates are a last resort. A formula whose triggers already matched is
++            // left alone: adding to a working set of candidates only makes the strategy choose
++            // between more of them, and it chose well enough without the additions.
++            if (instancesWithCosts.isEmpty()) {
++                addAtomicGroundInstances((JTerm) matrix, services, new LinkedHashSet<>());
++            }
++        }
++    }
++
++    /** Ceiling on ground candidates taken from one quantified formula. */
++    private static final int MAX_GROUND_INSTANCES = 16;
++
++    /**
++     * Instance candidates taken from the quantified formula's own body, when nothing else offered
++     * any.
++     *
++     * A subterm under the quantifier that contains no quantified variable is a well-sorted ground
++     * term, so instantiating with it is sound, but no trigger can produce it: matching binds a
++     * variable by finding it inside a pattern, and a term with no variable offers nothing to bind.
++     * A quantifier whose triggers match nothing in the sequent is otherwise never instantiated at
++     * all, and the terms its own body names are the ones it is about.
++     *
++     * Only constants and numerals are taken. A compound ground term is a poor instance for the
++     * same reason it is a large one: substituting it enlarges the formula rather than letting it
++     * collapse, and for a variable ranging over a theory sort it can bury the search.
++     */
++    private void addAtomicGroundInstances(JTerm term, Services services, Set<Term> seen) {
++        if (seen.size() >= MAX_GROUND_INSTANCES) {
++            return;
+         }
++        if (isAtomicGround(term, services) && term.sort().extendsTrans(firstVar.sort())
++                && seen.add(term)) {
++            final ImmutableMap<QuantifiableVariable, Term> varMap =
++                DefaultImmutableMap.<QuantifiableVariable, Term>nilMap().put(firstVar, term);
++            addInstance(new Substitution(varMap), services);
++        }
++        for (int i = 0; i < term.arity(); i++) {
++            addAtomicGroundInstances(term.sub(i), services, seen);
++        }
+     }
+ 
+     /**
++     * Whether a term is a ground constant or a literal.
++     *
++     * An integer literal is not a leaf: it is the numeral symbol applied to its digits, so arity
++     * alone would exclude exactly the terms this is for.
++     */
++    private boolean isAtomicGround(JTerm term, Services services) {
++        if (term.sort() == JavaDLTheory.FORMULA || !term.freeVars().isEmpty()) {
++            return false;
++        }
++        // Literals only. A ground constant is already a term the sequent talks about, so trigger
++        // matching had its chance at it; a literal buried in a guard or an index is the one thing
++        // matching cannot reach.
++        return term.op() == services.getTypeConverter().getIntegerLDT().getNumberSymbol();
++    }
++
++    /**
+      * Heap-aware instance candidates from write coordinates: where the matrix reads an array
+      * through a built-up heap, {@code select(... store(h, o, arr(c), v) ..., o, arr(j))} with
+      * quantified index {@code j}, the written index {@code c} is a candidate for {@code j}.

@@ -1,0 +1,70 @@
+diff --git a/key.core/src/main/java/de/uka/ilkd/key/strategy/quantifierHeuristics/Instantiation.java b/key.core/src/main/java/de/uka/ilkd/key/strategy/quantifierHeuristics/Instantiation.java
+index cdd2f5dd3f..82edbc8e65 100644
+--- a/key.core/src/main/java/de/uka/ilkd/key/strategy/quantifierHeuristics/Instantiation.java
++++ b/key.core/src/main/java/de/uka/ilkd/key/strategy/quantifierHeuristics/Instantiation.java
+@@ -5,9 +5,11 @@ package de.uka.ilkd.key.strategy.quantifierHeuristics;
+ 
+ import java.util.ArrayList;
+ import java.util.HashMap;
++import java.util.LinkedHashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ 
+ import de.uka.ilkd.key.java.Services;
+ import de.uka.ilkd.key.ldt.JavaDLTheory;
+@@ -20,6 +22,7 @@ import de.uka.ilkd.key.proof.Proof;
+ 
+ import org.key_project.logic.Term;
+ import org.key_project.logic.op.QuantifiableVariable;
++import org.key_project.logic.sort.Sort;
+ import org.key_project.prover.sequent.Sequent;
+ import org.key_project.prover.sequent.SequentFormula;
+ import org.key_project.prover.strategy.costbased.NumberRuleAppCost;
+@@ -88,6 +91,45 @@ class Instantiation {
+         // write-coordinate candidates are part of the theory-aware selection, dropped in classic
+         if (!classic) {
+             addStoreCoordinateInstances((JTerm) matrix, services);
++            addGroundSubtermInstances((JTerm) matrix, services, new LinkedHashSet<>());
++        }
++    }
++
++    /**
++     * Ceiling on ground subterm candidates taken from one quantified formula.
++     *
++     * Each candidate costs a cost prediction, so a formula built over many distinct ground terms
++     * would pay for a long tail of them. The instances that make a quantifier collapse are the few
++     * the formula names itself, so a small bound keeps what matters.
++     */
++    private static final int MAX_GROUND_SUBTERM_INSTANCES = 32;
++
++    /**
++     * Instance candidates taken from the quantified formula's own body.
++     *
++     * A subterm under the quantifier that contains no quantified variable is a well-sorted ground
++     * term, so instantiating with it is sound, but no trigger can produce it: matching binds a
++     * variable by finding it inside a pattern, and a term with no variable in it offers nothing to
++     * bind. Where a quantifier speaks about indices or values that its own body names literally,
++     * those are exactly the instances that let it collapse. A guard {@code 0 <= i & i <= 5} and a
++     * write {@code store(a, 0, 5)} carry the interesting indices with them.
++     *
++     * Candidates go through the same cost computation as matched ones, so those that lead nowhere
++     * are dropped there rather than here.
++     */
++    private void addGroundSubtermInstances(JTerm term, Services services, Set<Term> seen) {
++        if (seen.size() >= MAX_GROUND_SUBTERM_INSTANCES) {
++            return;
++        }
++        final Sort varSort = firstVar.sort();
++        if (term.sort() != JavaDLTheory.FORMULA && term.freeVars().isEmpty()
++                && term.sort().extendsTrans(varSort) && seen.add(term)) {
++            final ImmutableMap<QuantifiableVariable, Term> varMap =
++                DefaultImmutableMap.<QuantifiableVariable, Term>nilMap().put(firstVar, term);
++            addInstance(new Substitution(varMap), services);
++        }
++        for (int i = 0; i < term.arity(); i++) {
++            addGroundSubtermInstances(term.sub(i), services, seen);
+         }
+     }
+ 
